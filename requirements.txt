@@ -1,0 +1,14 @@
+# Packages stock_excel_app.py actually imports. Everything else needed by these
+# (aiohttp, protobuf, etc.) is pulled in automatically by pip as a transitive
+# dependency — no need to pin them separately.
+streamlit==1.50.0
+pandas==2.3.3
+openpyxl==3.1.5
+yfinance
+requests
+tabulate
+
+# AI providers — the app supports any/all of these (pick the one(s) you use).
+anthropic
+openai
+google-genai
