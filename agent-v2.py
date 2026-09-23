@@ -541,39 +541,23 @@ AI_DISCLAIMER = (
 )
 
 AI_SYSTEM_PROMPT = """You are a portfolio research assistant with live web search \
-access. You will be given a list of stock symbols with their price-change statistics \
-(current price, purchase price, gain/loss %, and 1D/1W/1M/3M/6M/1Y % change) for \
-context. For EACH stock, use web search to find current news, recent earnings \
-results, and fundamentals (e.g. P/E, revenue/profit growth, guidance, major \
-announcements) — do not rely on the price data alone.
+access. You're given stock symbols with price stats (current price, purchase price, \
+gain/loss %, 1D/1W/1M/3M/6M/1Y % change) for context. For EACH stock, search the web \
+for current news, recent earnings, and fundamentals (P/E, growth, guidance) — don't \
+rely on price data alone.
 
-Respond with ONLY a JSON array — no markdown code fences, no prose before or after \
-it, nothing but the array itself. One object per stock listed, covering every stock \
-given (do not omit any, and do not add extra entries such as a total/summary row), \
-using exactly these keys:
+Respond with ONLY a JSON array — no code fences, no text before or after it. One \
+object per stock, covering every stock given (no omissions, no extra entries), with \
+exactly these keys:
 
-[
-  {
-    "stock": "<the exact stock symbol as given to you>",
-    "momentum_pattern": "<a few words classifying momentum using ONLY the timeframe data given, e.g. 'Sustained uptrend', 'Mixed signals (short vs long term)', 'High volatility', 'Flat / no clear trend'>",
-    "key_news_fundamentals": "<1-2 sentences on what search found: recent earnings/results, notable announcements, or fundamental context (P/E, growth, guidance), each with its source (publication/site name) and approximate date. If search finds nothing relevant, say so plainly ('No notable recent news found') rather than inventing something.>",
-    "outlook_note": "<ONE sentence synthesizing the price pattern AND the news/fundamentals together — e.g. whether they reinforce or conflict — plus what would make that read less compelling (a reversal, thin evidence, stale news, high volatility). Cite a specific number or source. Speculative only — NEVER a price prediction, guarantee, or buy/sell instruction.>"
-  }
-]
+[{"stock": "<exact symbol given>", "momentum_pattern": "<few words, from the timeframe data only, e.g. 'Sustained uptrend', 'Mixed signals', 'High volatility', 'Flat / no clear trend'>", "key_news_fundamentals": "<1-2 sentences on what search found — earnings, announcements, fundamentals — each with source and approx. date; say 'No notable recent news found' if search finds nothing, rather than inventing something>", "outlook_note": "<ONE sentence combining the price pattern and the news/fundamentals, citing a specific number or source; speculative only — never a prediction, guarantee, or buy/sell instruction>"}]
 
-STRICT RULES:
-- Never state something as a fact about a company unless it came from a search result \
-or the data given to you — do not invent news, earnings figures, or fundamentals.
-- Never use "guaranteed", "certain", "will definitely", or similar. Frame everything \
-as a possibility, never a certainty.
-- Never give direct buy/sell/hold instructions anywhere, including in outlook_note. \
-Use language like "worth monitoring" rather than "should buy".
-- Do not use the word "multibagger" as a promise — if you reference the idea, frame \
-it explicitly as a high-risk, speculative category, not a fact.
-- Vague, generic statements (e.g. "performing well") are not acceptable — every \
-claim must cite something specific.
-- Output ONLY the JSON array described above — no other text, no markdown formatting, \
-no code fences, nothing else.
+RULES: state nothing as fact unless it's from a search result or the data given — \
+never invent news, figures, or fundamentals. Never say "guaranteed", "certain", or \
+"will definitely". Never give buy/sell/hold instructions — say "worth monitoring", \
+not "should buy". Treat "multibagger" only as a speculative, high-risk label, never \
+a promise. No vague claims ("performing well") — cite something specific every time. \
+Output ONLY the JSON array — nothing else, no formatting around it.
 """
 
 
@@ -615,19 +599,63 @@ def compute_stock_numeric_df(sheets):
     return combined
 
 
+def _json_array_candidates(text):
+    """Yield progressively more permissive guesses at where the JSON array is
+    within a messier-than-expected LLM response, in order of preference."""
+    yield text
+
+    fence_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+    if fence_match:
+        yield fence_match.group(1)
+
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        yield text[start : end + 1]
+
+
+def looks_like_truncated_json(parse_error_message, raw_text):
+    """Infer truncation directly from the shape of the JSON parse failure,
+    independent of whatever the provider's own finish/stop reason said. An
+    'Unterminated string' error is only possible when the input ends mid-string
+    — complete, valid JSON can never produce it — so it's treated as a certain
+    signal on its own. Otherwise, if the reported error position is right at
+    the end of the response, that's the same signature."""
+    if not parse_error_message:
+        return False
+    if "Unterminated string" in parse_error_message:
+        return True
+    match = re.search(r"\(char (\d+)\)", parse_error_message)
+    if match and raw_text:
+        return int(match.group(1)) >= len(raw_text) - 5
+    return False
+
+
 def parse_ai_qualitative_json(raw_text):
     """Parse the LLM's JSON response into {symbol: {Momentum Pattern, Key News &
     Fundamentals, Outlook Note}}. Returns (qual_map, error_message) — error_message
     is None on success, so callers can show the raw text if parsing fails instead
-    of crashing on a malformed response."""
+    of crashing on a malformed response.
+
+    Tries three ways to find the array, since models don't always follow "JSON
+    only, no fences" exactly: (1) the whole response as-is, (2) a ```json fenced
+    block found anywhere in the text (not just at the very start/end), (3) a
+    plain slice from the first '[' to the last ']', which tolerates stray prose
+    before/after the array."""
+    if not raw_text or not raw_text.strip():
+        return {}, "The AI returned an empty response. Try running the analysis again."
+
     text = raw_text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        return {}, f"Could not parse the AI's response as JSON ({exc}). Raw response below."
+    data, last_err = None, None
+
+    for candidate in _json_array_candidates(text):
+        try:
+            data = json.loads(candidate)
+            break
+        except json.JSONDecodeError as exc:
+            last_err = exc
+
+    if data is None:
+        return {}, f"Could not parse the AI's response as JSON ({last_err}). Raw response below."
 
     qual_map = {}
     for item in data:
@@ -701,7 +729,7 @@ def build_analysis_prompt(sheets):
 def run_ai_analysis(provider, api_key, model, sheets, max_tokens=4096):
     """Runs the batch Portfolio Overview + Performance Analysis report, grounded in
     live web search (news/earnings/fundamentals) via the same per-provider search
-    plumbing as the chat/scanner features. Returns (report_text, model_used)."""
+    plumbing as the chat/scanner features. Returns (report_text, model_used, truncated)."""
     data_prompt = build_analysis_prompt(sheets)
     num_stocks = sum(len(df[df["Stock Symbol"] != "TOTAL"]) for df in sheets.values())
     # One search per stock would be ideal but is impractical for larger portfolios
@@ -733,7 +761,7 @@ CHAT_DISCLAIMER = (
     "anything. Consult a licensed financial advisor before making investment decisions."
 )
 
-OPENAI_SEARCH_MODEL_FALLBACK = "gpt-4o-search-preview"
+OPENAI_SEARCH_MODEL_FALLBACK = "gpt-5-search-api"
 
 
 def build_chat_system_prompt(exclude_symbols=None, scanner_report=None):
@@ -791,6 +819,18 @@ still grounded, sourced, and excluding the person's own holdings as above.
 """
 
 
+def _reason_indicates_truncation(reason):
+    """True if a provider's stop/finish reason indicates the response was cut
+    off by the token limit. Deliberately robust rather than an exact string
+    match: SDKs often return an enum object whose str() includes a class-name
+    prefix (e.g. 'FinishReason.MAX_TOKENS', not just 'MAX_TOKENS'), which an
+    exact comparison silently fails to match — this checks a substring of
+    whichever text representation is available instead."""
+    name = getattr(reason, "name", reason)
+    text = str(name).upper()
+    return "MAX_TOKEN" in text or "LENGTH" in text
+
+
 def chat_anthropic(api_key, model, system_prompt, history, max_tokens=2048, max_search_uses=5):
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
@@ -800,7 +840,16 @@ def chat_anthropic(api_key, model, system_prompt, history, max_tokens=2048, max_
         messages=[{"role": m["role"], "content": m["content"]} for m in history],
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": max_search_uses}],
     )
-    return "\n".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+    text = "\n".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+    if not text.strip():
+        stop_reason = getattr(response, "stop_reason", "unknown")
+        raise RuntimeError(
+            f"Claude returned no text content (stop_reason={stop_reason}). This can "
+            "happen if the response was cut off mid-search or hit the token limit "
+            "before writing any output — try again, or raise max_tokens."
+        )
+    truncated = _reason_indicates_truncation(getattr(response, "stop_reason", None))
+    return text, truncated
 
 
 def chat_openai(api_key, model, system_prompt, history, max_tokens=2048):
@@ -814,7 +863,17 @@ def chat_openai(api_key, model, system_prompt, history, max_tokens=2048):
         max_tokens=max_tokens,
         messages=messages,
     )
-    return response.choices[0].message.content, effective_model
+    content = response.choices[0].message.content
+    finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+    if not content or not content.strip():
+        raise RuntimeError(
+            f"OpenAI ({effective_model}) returned no text content (finish_reason="
+            f"{finish_reason}). This can happen with search-enabled models when the "
+            "response is cut off before producing text, or contains only tool-call "
+            "data — try again, raise max_tokens, or try a different provider."
+        )
+    truncated = _reason_indicates_truncation(finish_reason)
+    return content, effective_model, truncated
 
 
 def chat_gemini(api_key, model, system_prompt, history, max_tokens=2048):
@@ -833,20 +892,34 @@ def chat_gemini(api_key, model, system_prompt, history, max_tokens=2048):
             max_output_tokens=max_tokens,
         ),
     )
-    return response.text
+    text = getattr(response, "text", None)
+    candidates = getattr(response, "candidates", None)
+    finish_reason = getattr(candidates[0], "finish_reason", "unknown") if candidates else "unknown"
+    if not text or not text.strip():
+        raise RuntimeError(
+            f"Gemini returned no text content (finish_reason={finish_reason}). This "
+            "can happen if the response was blocked, truncated, or contained only "
+            "search/tool data — try again, or raise max_tokens."
+        )
+    truncated = _reason_indicates_truncation(finish_reason)
+    return text, truncated
 
 
 def run_chat_turn(provider, api_key, model, system_prompt, history, max_tokens=2048, max_search_uses=5):
-    """Returns (reply_text, model_actually_used) — model can differ from the
-    configured one for OpenAI, since search needs a dedicated model."""
+    """Returns (reply_text, model_actually_used, truncated) — model can differ
+    from the configured one for OpenAI, since search needs a dedicated model.
+    truncated=True means the response was cut off by the token limit, not that
+    it finished naturally — callers should surface this rather than presenting
+    a cut-off answer as if it were complete."""
     if provider == "OpenAI":
         return chat_openai(api_key, model, system_prompt, history, max_tokens=max_tokens)
     if provider == "Gemini":
-        return chat_gemini(api_key, model, system_prompt, history, max_tokens=max_tokens), model
-    return (
-        chat_anthropic(api_key, model, system_prompt, history, max_tokens=max_tokens, max_search_uses=max_search_uses),
-        model,
+        text, truncated = chat_gemini(api_key, model, system_prompt, history, max_tokens=max_tokens)
+        return text, model, truncated
+    text, truncated = chat_anthropic(
+        api_key, model, system_prompt, history, max_tokens=max_tokens, max_search_uses=max_search_uses
     )
+    return text, model, truncated
 
 
 # --------------------------------------------------------------------------------------
@@ -1098,7 +1171,8 @@ def build_scanner_system_prompt(detail_level="Detailed"):
 
 def run_scanner_analysis(provider, api_key, model, max_tokens, exclude_symbols=None, detail_level="Detailed"):
     """Single-turn, search-grounded run of the Catalyst & Momentum Scanner prompt.
-    Reuses the same per-provider plumbing as the chat feature."""
+    Reuses the same per-provider plumbing as the chat feature. Returns
+    (reply_text, model_used, truncated)."""
     system_prompt = build_scanner_system_prompt(detail_level)
     user_prompt = "Run the full scan now, following every phase exactly as specified."
     if exclude_symbols:
@@ -1110,10 +1184,14 @@ def run_scanner_analysis(provider, api_key, model, max_tokens, exclude_symbols=N
             "of them currently has a fresh catalyst: " + ", ".join(exclude_symbols)
         )
     history = [{"role": "user", "content": user_prompt}]
-    reply, model_used = run_chat_turn(
-        provider, api_key, model, system_prompt, history, max_tokens=max_tokens
+    # A moderate, deliberate search budget: enough for light cross-verification
+    # across a ~10+ stock coverage target (Phase 19), without eating so much of
+    # the same token pool that there's no room left to write the tables out —
+    # the generic chat default of 5 undershoots what this task actually needs,
+    # while going much higher would worsen the exact truncation this is tuned to avoid.
+    return run_chat_turn(
+        provider, api_key, model, system_prompt, history, max_tokens=max_tokens, max_search_uses=15
     )
-    return reply, model_used
 
 
 # --------------------------------------------------------------------------------------
@@ -1125,9 +1203,13 @@ SORTABLE_SCANNER_SECTIONS = ["Today's Catalyst Scanner", "One-Week Watchlist"]
 
 
 def parse_markdown_table(block_text):
-    """Parse the first Markdown pipe-table found in a block of text into a
-    DataFrame. Returns None if no valid table is found (caller should fall back
-    to rendering the raw text instead of crashing)."""
+    """Parse Markdown pipe-table(s) found in a block of text into one DataFrame.
+    Handles the model splitting a section into several mini-tables that each
+    repeat the header + separator row (e.g. one per watchlist category) by
+    dropping every repeated header/separator occurrence, not just the first —
+    otherwise a repeated header row gets mis-parsed as a literal data row.
+    Returns None if no valid table is found (caller should fall back to
+    rendering the raw text instead of crashing)."""
     lines = [l for l in block_text.splitlines() if l.strip().startswith("|")]
     if len(lines) < 2:
         return None
@@ -1137,11 +1219,20 @@ def parse_markdown_table(block_text):
         return [c.strip() for c in cells]
 
     header = split_row(lines[0])
-    # Row 1 should be the header, row 2 the "---|---|---" separator — skip it if present.
-    data_start = 1
-    if len(lines) > 1 and re.match(r"^[\s|:-]+$", lines[1]):
-        data_start = 2
-    data_rows = [split_row(l) for l in lines[data_start:]]
+    header_key = [c.lower() for c in header]
+
+    def is_separator(cells_or_line):
+        return bool(re.match(r"^[\s|:-]+$", cells_or_line))
+
+    data_rows = []
+    for line in lines[1:]:
+        if is_separator(line):
+            continue
+        cells = split_row(line)
+        if [c.lower() for c in cells] == header_key:
+            continue  # a repeated header row from a second/third mini-table
+        data_rows.append(cells)
+
     # Guard against rows with a different cell count than the header (a model
     # formatting slip) rather than letting pandas raise on a ragged table.
     data_rows = [r for r in data_rows if len(r) == len(header)]
@@ -1258,8 +1349,21 @@ with st.sidebar:
         "numbers (not your identity) are sent to the chosen provider's API for this."
     )
     # Always run at the most detailed budget — no control shown, per request.
-    AI_MAX_TOKENS = 8192
+    # 16384, not 8192 — for a full portfolio, max_search_uses scales up to 40
+    # searches, and search steps themselves consume tokens from this same budget
+    # before the model ever writes the final JSON. 8192 was too tight and caused
+    # truncation mid-response for larger portfolios.
+    AI_MAX_TOKENS = 16384
     ai_provider = st.radio("Provider", options=["OpenAI", "Anthropic", "Gemini"], horizontal=True)
+
+    def model_picker(label, options, help_text):
+        """Dropdown with a 'Custom...' escape hatch — model names shift often
+        enough that a hardcoded list can go stale, so there's always a way to
+        type an exact string instead of being stuck with what's listed here."""
+        choice = st.selectbox(label, options + ["Custom..."], index=0, help=help_text)
+        if choice == "Custom...":
+            return st.text_input(f"{label} (custom)", placeholder="Type the exact model name")
+        return choice
 
     if ai_provider == "OpenAI":
         ai_api_key = st.text_input(
@@ -1267,11 +1371,13 @@ with st.sidebar:
             value=get_secret("OPENAI_API_KEY"),
             type="password",
         )
-        ai_model = st.text_input(
+        ai_model = model_picker(
             "Model",
-            value="gpt-4o-mini",
-            help="Basic chat.completions usage — any OpenAI chat model works. "
-            "gpt-4o-mini is a cheap, fast default for this kind of summarization task.",
+            ["gpt-5-search-api", "gpt-5.5", "gpt-5.5-pro", "gpt-4o-mini"],
+            "gpt-5-search-api is built for search-grounded tasks like the Scanner. "
+            "gpt-5.5-pro is the strongest general option; gpt-4o-mini is cheap/fast "
+            "but more prone to cutting off long, complex outputs. Any OpenAI chat "
+            "model works if you pick Custom — this list can go stale.",
         )
     elif ai_provider == "Gemini":
         ai_api_key = st.text_input(
@@ -1279,11 +1385,14 @@ with st.sidebar:
             value=get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY"),
             type="password",
         )
-        ai_model = st.text_input(
+        ai_model = model_picker(
             "Model",
-            value="gemini-2.5-flash",
-            help="Any Gemini model works — this is a free-text field since model "
-            "names change over time. 'flash' variants are the cheap/fast tier.",
+            ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash-lite"],
+            "The 'pro' tier is strongest for long, complex output like the Scanner. "
+            "'Flash' tiers are cheaper/faster but more prone to cutting off long "
+            "output. Any Gemini model works if you pick Custom — naming here "
+            "shifts often, so double-check against ai.google.dev/gemini-api/docs/models "
+            "if an option fails.",
         )
     else:
         ai_api_key = st.text_input(
@@ -1291,10 +1400,11 @@ with st.sidebar:
             value=get_secret("ANTHROPIC_API_KEY"),
             type="password",
         )
-        ai_model = st.selectbox(
+        ai_model = model_picker(
             "Model",
-            options=["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5-20251001"],
-            index=0,
+            ["claude-sonnet-5", "claude-opus-5-5", "claude-haiku-4-5-20251001"],
+            "Sonnet balances quality and cost; Opus is strongest for long, complex "
+            "output like the Scanner; Haiku is cheapest/fastest.",
         )
 
 
@@ -1429,10 +1539,12 @@ with tab1:
                 st.error(f"Missing dependency. Install with:\n\n    pip install {pip_name}")
             elif not ai_api_key:
                 st.error(f"Enter your {ai_provider} API key in the sidebar first.")
+            elif not ai_model:
+                st.error("Enter a model name in the sidebar first.")
             else:
                 with st.spinner("Researching and analyzing (very detailed) — this involves live searches..."):
                     try:
-                        raw_text, model_used = run_ai_analysis(
+                        raw_text, model_used, truncated = run_ai_analysis(
                             ai_provider, ai_api_key, ai_model, sheets, max_tokens=AI_MAX_TOKENS
                         )
                         qual_map, parse_error = parse_ai_qualitative_json(raw_text)
@@ -1442,7 +1554,22 @@ with tab1:
                             if model_used != ai_model
                             else None
                         )
+                        # OR with a content-based check: don't rely solely on the provider's
+                        # own finish-reason flag, since that's proven unreliable to parse
+                        # correctly across SDKs — the shape of the JSON failure itself is
+                        # independent evidence.
+                        truncated = truncated or looks_like_truncated_json(parse_error, raw_text)
+                        st.session_state["ai_truncated"] = truncated
                         if parse_error:
+                            if truncated:
+                                parse_error = (
+                                    "This response was cut off by the token limit before it finished "
+                                    "writing — that's why it doesn't parse as valid JSON (a broken string "
+                                    "or missing bracket at the cut point), not a formatting mistake. "
+                                    "A large portfolio needing many searches can use up most of the "
+                                    "budget before writing any output. Try again, or this portfolio may "
+                                    "need a higher AI_MAX_TOKENS than the app currently uses."
+                                )
                             st.session_state["ai_performance_df"] = None
                             st.session_state["ai_parse_error"] = parse_error
                             st.session_state["ai_raw_response"] = raw_text
@@ -1453,6 +1580,11 @@ with tab1:
                     except Exception as exc:  # noqa: BLE001 - surface any API error to the user
                         st.error(f"AI analysis failed: {exc}")
 
+        if st.session_state.get("ai_truncated"):
+            st.warning(
+                "⚠️ The last response hit the token limit before finishing — treat it as "
+                "incomplete. See the note below for why and what to try."
+            )
         if st.session_state.get("ai_model_note"):
             st.caption(f"*{st.session_state['ai_model_note']}*")
 
@@ -1517,7 +1649,10 @@ with tab2:
     # Always run at full depth — this prompt asks for many tables plus a deep
     # dive, and thin token budgets were cutting analysis short. No control
     # shown for this since there's no good reason to run it any shallower.
-    SCANNER_MAX_TOKENS = 16384
+    # 32768, not 16384 — even Summary mode's two tables (each covering the
+    # >=10-stock coverage target) plus the search steps consuming part of the
+    # same budget was still running out before finishing the last section.
+    SCANNER_MAX_TOKENS = 32768
 
     scanner_output_level = st.radio(
         "Output length",
@@ -1544,19 +1679,30 @@ with tab2:
             st.error(f"Missing dependency. Install with:\n\n    pip install {pip_name}")
         elif not ai_api_key:
             st.error(f"Enter your {ai_provider} API key in the sidebar first.")
+        elif not ai_model:
+            st.error("Enter a model name in the sidebar first.")
         else:
             with st.spinner("Scanning (comprehensive) — this involves several live searches..."):
                 try:
-                    report, model_used = run_scanner_analysis(
+                    report, model_used, truncated = run_scanner_analysis(
                         ai_provider, ai_api_key, ai_model, SCANNER_MAX_TOKENS,
                         holdings_to_exclude, detail_level=scanner_output_level,
                     )
+                    prefix = ""
                     if model_used != ai_model:
-                        report = (
+                        prefix += (
                             f"*(used {model_used} for web search — your configured "
-                            f"model doesn't support it)*\n\n{report}"
+                            f"model doesn't support it)*\n\n"
                         )
-                    st.session_state["scanner_report"] = report
+                    if truncated:
+                        prefix += (
+                            "⚠️ **This scan hit the token limit before finishing — it's cut off, "
+                            "not a complete report.** This prompt asks for a lot of output (many "
+                            "tables plus a multi-stock deep dive). Try 'Summary' output length "
+                            "above, which asks for far less text and is much more likely to "
+                            "finish completely, or try again since search-heavy runs vary in length.\n\n"
+                        )
+                    st.session_state["scanner_report"] = prefix + report
                 except Exception as exc:  # noqa: BLE001 - surface any API error to the user
                     st.error(f"Scan failed: {exc}")
 
@@ -1628,6 +1774,9 @@ with tab2:
         elif not ai_api_key:
             st.error(f"Enter your {ai_provider} API key in the sidebar first.")
             st.session_state["_chat_pending"] = False
+        elif not ai_model:
+            st.error("Enter a model name in the sidebar first.")
+            st.session_state["_chat_pending"] = False
         else:
             with st.spinner("Searching and responding..."):
                 try:
@@ -1635,11 +1784,13 @@ with tab2:
                         exclude_symbols=holdings_to_exclude,
                         scanner_report=st.session_state.get("scanner_report"),
                     )
-                    reply, model_used = run_chat_turn(
+                    reply, model_used, truncated = run_chat_turn(
                         ai_provider, ai_api_key, ai_model, system_prompt, st.session_state["chat_messages"]
                     )
                     if model_used != ai_model:
                         reply = f"*(used {model_used} for web search — your configured model doesn't support it)*\n\n{reply}"
+                    if truncated:
+                        reply += "\n\n⚠️ *This reply hit the token limit before finishing — it may be cut off.*"
                     st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
                 except Exception as exc:  # noqa: BLE001 - surface any API error to the user
                     st.session_state["chat_messages"].append(
